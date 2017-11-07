@@ -1,0 +1,206 @@
+#!/bin/bash
+# #########################################################################
+# File: MiSeqPipeline 
+# Description: This shell script implements a pipeline for 
+# Illumina MiSeq Sequencing for samples that takes BAM input from CLCbio,
+# sorts BAM file, index BAM files, uses mpileup for sorted BAM files,
+# filters high quality SNPs, and converts into FASTA file for exporting back
+# to the CLCbio for generating tree  
+# Usage: MiSeqPipeline
+# Created by: Rituparna Mukhopadhyay
+# Created on: 12/28/2015
+# Last modified on:  5/11/2016
+# Copyright:  California Departmnet of Public Health (MDL)
+# ###########################################################################
+
+set -o errexit
+
+START_TIME=`date "+%Y%m%d_%H_%M_%S"`
+SAM_HOME="/usr/local/bin"  # default location of the samtools utilities
+VCF_UTILS_HOME="/usr/local/bin" #vcfutils.pl & bcftools
+#VCF_UTILS_HOME="/Users/macbookpro/BCF/bcftools"
+VCF_TAB_HOME="/Users/corelab/Desktop/CDPH_programs/vcf-tab-to-fasta" 
+#VCF_TAB_HOME="/Users/macbookpro/vcf-tab-to-fasta" 
+pileups=24 #number of pileups needed in this pipeline
+inputBamDir=""  # by default there is no input BAM dir.  Has to be specified
+refGenomeFileName="" # by default there is no default reference Genome file name
+export PERL5LIB="/Users/corelab/Desktop/CDPH_programs/vcftools_0.1.12b/perl" #need to export this variable that holds location of Vcf.pm
+#export PERL5LIB="/Users/macbookpro/Downloads/vcftools_0.1.12b/perl"
+export VCF_TOOLS_HOME="/Users/corelab/Desktop/CDPH_programs/vcftools_0.1.12b/bin" #need this in CDPH machine.  Location of vcf-concat, vcf-sort etc.
+#export VCF_TOOLS_HOME="/usr/local/bin" #need this in home machine
+export PATH=$PATH:$SAM_HOME:$VCF_UTILS_HOME:$VCF_TAB_HOME:$VCF_TOOLS_HOME
+export LOGFILE="MiSeqPipeline_$START_TIME.log"
+debug=false
+
+function mylog ()
+{
+  echo $1
+  echo $1 >> $LOGFILE
+}
+
+function usage
+{
+  echo ""
+  echo "Usage: MiSeqPipeline --inputBamDir=/path/to/inputBamDir --refGenomeFileName=nameOfReferenceGenomeFile [--SAM_HOME=/path/to/SAMTools]"
+  echo ""
+}
+
+mylog "[MiSeqPipeline] MiSeqPipeline start time:  $START_TIME"
+
+
+
+# Parse command line
+for par in "$@" # all positional parameters with individuals quoted
+do
+  case $par in
+    --inputBamDir=*)
+    inputBamDir="${par#*=}"
+    shift
+    ;;
+    --refGenomeFileName=*)
+    export refGenomeFileName="${par#*=}"
+    shift
+    ;;
+    --SAM_HOME=*)
+    SAM_HOME="${par#*=}"
+    shift
+    ;;
+    -h|--help)
+    usage
+    ;;
+    -d|--debug)
+    debug=true
+    ;;
+    *)  #unknown
+    usage;;
+  esac
+done
+
+# validate that the parameters are valid
+
+if [ "$debug" = true ]; then
+  mylog "[MiSeqPipeline] Debug | Input BAM Directory: $inputBamDir"
+  mylog "[MiSeqPipeline] Debug | Reference Genome File Name: $refGenomeFileName"
+  mylog "[MiSeqPipeline] Debug | SAM Home Directory: $SAM_HOME"
+fi
+
+if [ ! -d "$inputBamDir" ]; then # if the input BAM directory does not exist
+  mylog "[MiSeqPipeline] Specified Input BAM directory does not exist.  Try again"
+  usage
+  exit 1
+fi
+
+if [ ! -f "$inputBamDir/$refGenomeFileName" ]; then # if the ref genome does not exist
+  mylog "[MiSeqPipeline] Reference Genome file not found in $inputBamDir.  Try again"
+  usage
+  exit 1
+fi
+
+if [ ! -d "$SAM_HOME" ]; then # if the specified SAM Tools directory does not exist
+  mylog "[MiSeqPipeline] Specified SAM Tools directory does not exist.  Try again"
+  usage
+  exit 1
+else
+  if [ ! -f "$SAM_HOME/samtools" ]; then
+    mylog "[MiSeqPipeline] SAM tools utility not present in specified SAM_HOME.  Try again"
+    usage
+    exit 1
+  fi
+fi
+
+mkdir -p $inputBamDir/sorted_bam
+export sortBamDir="$inputBamDir/sorted_bam"
+
+if [ "$debug" = true ]; then
+  mylog "[MiSeqPipeline] Debug | Sorted BAM Directory: $sortBamDir"
+fi
+
+
+mylog "[MiSeqPipeline] Directory created for sorted BAM files"
+
+
+# sort the input BAM files and create index in the sorted BAM directory
+mylog "[MiSeqPipeline] Sorting and indexing input BAM files"
+for file in $inputBamDir/*.bam
+do
+  filename=`basename $file`
+  filename="${filename%\.bam}"
+  #echo $filename
+  #break
+  $SAM_HOME/samtools sort $file $sortBamDir/$filename.sorted 2>&1 | tee -a $LOGFILE
+  $SAM_HOME/samtools index $sortBamDir/$filename.sorted* 2>&1 | tee -a $LOGFILE  #$sortBamDir/$file.sorted.bai 
+  mylog "[MiSeqPipeline] Processed $filename.bam"
+done
+
+mylog "[MiSeqPipeline] BAM files sorted and indexed"
+
+# move the reference genome file to the sorted BAM directory
+cp $inputBamDir/$refGenomeFileName $sortBamDir
+
+# index the reference genome file
+$SAM_HOME/samtools faidx $sortBamDir/$refGenomeFileName 2>&1 | tee -a $LOGFILE
+mylog "[MiSeqPipeline] Indexed reference genome file"
+
+
+# find the number (2nd column) from the FAI file
+number=`awk -F"\t" '{print $2}' $sortBamDir/$refGenomeFileName.fai`
+
+mylog "[MiSeqPipeline] The number is: $number "
+
+# Divide the number by pileups and add 10 to it
+number=$((number/pileups + 10))
+
+mylog "[MiSeqPipeline] The number is: $number "
+
+# now call the vcfutils
+mylog "[MiSeqPipeline] Calling vcfutils.pl to generate the tmp VCF files"
+{
+  vcfutils.pl splitchr -l $number $sortBamDir/$refGenomeFileName.fai | xargs -n 1 -P $pileups -I {}  sh -c 'x="{}"; samtools mpileup -f $sortBamDir/$refGenomeFileName -r $x -t DP -g $sortBamDir/*.sorted.bam | bcftools view - > $sortBamDir/tmp.$x.vcf'
+} 2>&1 | tee -a $LOGFILE
+
+mylog "[MiSeqPipeline] tmp VCF files generated"
+
+# concat the temp VCF files
+mylog "[MiSeqPipeline] Concatenating tmp VCF files, sorting, and creating result"
+{
+  vcf-concat $sortBamDir/tmp.*.vcf | vcf-sort > $sortBamDir/res.vcf
+} 2>&1 | tee -a $LOGFILE
+
+
+mylog "[MiSeqPipeline] TMP VCF files concatenated.  Moving to TMP directory"
+mkdir -p $sortBamDir/tmp_vcf_folder
+mv $sortBamDir/tmp.*.vcf $sortBamDir/tmp_vcf_folder
+
+mylog "[MiSeqPipeline] Calling SNP/Indels and creating variants"
+{
+  $VCF_UTILS_HOME/bcftools call -c -v $sortBamDir/res.vcf > $sortBamDir/res_variants.vcf 
+} 2>&1 | tee -a $LOGFILE
+mylog "[MiSeqPipeline] Variants created"
+
+mylog "[MiSeqPipeline] Parse variants to include only hqSNPs (mean coverage > 30X, minimum quality > 200)"
+vcftools --vcf $sortBamDir/res_variants.vcf --min-meanDP 30 --minQ 200 --remove-indels --recode --out $sortBamDir/res_variants_HQ_SNPonly 2>&1 | tee -a $LOGFILE
+mylog "[MiSeqPipeline] hqSNPs created"
+
+
+mylog "[MiSeqPipeline] Removing heterozygote calls from haploid genomes"
+grep -v "0/1" $sortBamDir/res_variants_HQ_SNPonly.recode.vcf > $sortBamDir/res_variants_HQ_SNPonly_nohet.recode.vcf
+mylog "[MiSeqPipeline] Removed heterozygote calls from haploid genomes"
+
+
+mylog "[MiSeqPipeline] Converting VCF file to TAB file"
+{
+  vcf-to-tab < $sortBamDir/res_variants_HQ_SNPonly_nohet.recode.vcf > $sortBamDir/res_variants_HQ_SNPonly_nohet.recode.tab
+} 2>&1 | tee -a $LOGFILE
+mylog "[MiSeqPipeline] Conversion of VCF file to TAB file complete"
+
+mylog "[MiSeqPipeline] Converting TAB file to FASTA file"
+{
+  perl $VCF_TAB_HOME/vcf_tab_to_fasta_alignment.pl -i $sortBamDir/res_variants_HQ_SNPonly_nohet.recode.tab > $sortBamDir/res_variants_HQ_SNPonly_nohet.recode.fasta
+} 2>&1 | tee -a $LOGFILE
+mylog "[MiSeqPipeline] Conversion of TAB file to FASTA file complete"
+
+END_TIME=`date`
+mylog "[MiSeqPipeline] MiSeqPipeline end time:  $END_TIME"
+
+mv $LOGFILE $sortBamDir
+exit
